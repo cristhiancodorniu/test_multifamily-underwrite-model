@@ -4,3 +4,4 @@ numpy
 numpy-financial
 python-dateutil
 scipy
+xlsxwriter
