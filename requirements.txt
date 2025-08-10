@@ -5,3 +5,4 @@ numpy-financial
 python-dateutil
 scipy
 xlsxwriter
+altair
