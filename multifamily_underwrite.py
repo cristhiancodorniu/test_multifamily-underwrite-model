@@ -107,95 +107,103 @@ base_costs = land_costs + total_hard_costs + total_soft_costs + total_fees
 stabilized_occupancy_rate = 1 - min_vacancy_rate
 stabilized_occupied_units = int(num_units * stabilized_occupancy_rate)
 months_to_stabilize = construction_period + int(np.ceil(stabilized_occupied_units / leased_units_per_month)) if leased_units_per_month > 0 else construction_period
-hold_period = months_to_stabilize + 12 # Extend hold period for trended calculation
+hold_period = months_to_stabilize + 12
 dates = [project_start_date + relativedelta(months=i) for i in range(hold_period)]
 
-# Initialize loop variables
-total_capitalized_interest = 0.0
-total_operating_reserve = 0.0
-total_closing_costs = 0.0
-interest_rate = index_rate + spread_margin
+# ADDITION: Use st.spinner for a better user experience during long calculations
+with st.spinner('Running iterative financing calculations... Please wait.'):
+    # Initialize loop variables
+    total_capitalized_interest = 0.0
+    total_operating_reserve = 0.0
+    total_closing_costs = 0.0
+    interest_rate = index_rate + spread_margin
+    last_total_costs = 0.0 # For convergence check
 
-for i in range(25): # Iterate to solve for circular references
-    total_costs = base_costs + total_closing_costs + total_capitalized_interest + total_operating_reserve
-    total_debt = total_costs * loan_to_cost_ratio
-    total_equity = total_costs - total_debt
-    
-    closing_cost_origination = total_debt * origination_fee_pct
-    closing_cost_debt_proc = total_debt * debt_procurement_fee_pct
-    closing_cost_equity_proc = total_equity * equity_procurement_fee_pct
-    total_closing_costs = closing_cost_origination + closing_cost_debt_proc + closing_cost_equity_proc + legal_fees + ir_cap_costs + other_closing_costs
-    
-    cf = pd.DataFrame(index=pd.to_datetime(dates), dtype=np.float64)
-    cf['Month'] = range(1, hold_period + 1)
-    
-    construction_costs_monthly = np.zeros(hold_period)
-    if construction_period > 0:
-        hard_cost_pct = generate_s_curve_distribution(construction_period)
-        construction_costs_monthly[:construction_period] += total_hard_costs * hard_cost_pct
-        construction_costs_monthly[:construction_period] += (total_soft_costs + total_fees) / construction_period
-    
-    cf['Base Project Spend'] = construction_costs_monthly
-    cf.iloc[0, cf.columns.get_loc('Base Project Spend')] += (land_costs + total_closing_costs + total_operating_reserve)
-    
-    cf['Occupied Units'] = [min(stabilized_occupied_units, leased_units_per_month * (m - construction_period)) if m > construction_period else 0 for m in cf['Month']]
-    cf['Occupancy Rate'] = cf['Occupied Units'] / num_units if num_units > 0 else 0
-
-    weighted_rent = (studio_rent * studio_units + one_bed_rent * one_bed_units + two_bed_rent * two_bed_units + three_bed_rent * three_bed_units) / num_units if num_units > 0 else 0
-    opex_escalation_factor = (1 + opex_escalation) ** (cf['Month'] / 12)
-    revenue_escalation_factor = (1 + revenue_escalation) ** (cf['Month'] / 12)
-    cf['GPR'] = cf['Occupied Units'] * weighted_rent * revenue_escalation_factor
-    cf['Vacancy Loss'] = cf['GPR'] * min_vacancy_rate
-    cf['Credit Loss'] = cf['GPR'] * credit_loss
-    cf['Effective Billed Revenue'] = cf['GPR'] - cf['Vacancy Loss'] - cf['Credit Loss']
-    cf['EGI'] = cf['Effective Billed Revenue'] / (1 - other_income_pct) if other_income_pct < 1 else cf['Effective Billed Revenue']
-    cf['Other Income'] = cf['EGI'] * other_income_pct
-    cf['Opex'] = cf['Occupied Units'] * (opex_per_unit_year / 12) * opex_escalation_factor
-    cf['RE Taxes'] = cf['Occupied Units'] * (re_taxes_per_unit_year / 12) * opex_escalation_factor
-    cf['Insurance'] = cf['Occupied Units'] * (insurance_per_unit_year / 12) * opex_escalation_factor
-    cf['Management Fee'] = cf['EGI'] * mgmt_fee_pct
-    cf['Total Opex'] = cf['Opex'] + cf['RE Taxes'] + cf['Insurance'] + cf['Management Fee']
-    cf['NOI'] = cf['EGI'] - cf['Total Opex']
-    
-    cf['Net Funding Requirement'] = cf['Base Project Spend'] - cf['NOI']
-    
-    outstanding_balance = np.zeros(hold_period + 1, dtype=np.float64)
-    monthly_interest = np.zeros(hold_period, dtype=np.float64)
-    capitalized_interest_monthly = np.zeros(hold_period, dtype=np.float64)
-    
-    cf['Equity Draw'] = 0.0
-    cf['Debt Draw'] = 0.0
-
-    for m in range(hold_period):
-        monthly_interest[m] = outstanding_balance[m] * interest_rate / 12
-        funding_req_this_month = cf['Net Funding Requirement'].iloc[m]
-
-        if cf['Month'].iloc[m] <= construction_period:
-            funding_req_this_month += monthly_interest[m]
-            capitalized_interest_monthly[m] = monthly_interest[m]
+    for i in range(30): # Iterate up to 30 times
+        total_costs = base_costs + total_closing_costs + total_capitalized_interest + total_operating_reserve
         
-        equity_drawn_so_far = cf['Equity Draw'].sum()
-        equity_to_draw = max(0, min(funding_req_this_month, total_equity - equity_drawn_so_far))
-        
-        cf.loc[cf.index[m], 'Equity Draw'] = equity_to_draw
-        cf.loc[cf.index[m], 'Debt Draw'] = funding_req_this_month - equity_to_draw
-        
-        outstanding_balance[m+1] = outstanding_balance[m] + cf.loc[cf.index[m], 'Debt Draw']
+        # ADDITION: Check for convergence to exit loop early
+        if abs(total_costs - last_total_costs) < 1.00:
+            break
+        last_total_costs = total_costs
 
-    total_capitalized_interest = capitalized_interest_monthly.sum()
-    
-    post_construction_interest = monthly_interest * (cf['Month'] > construction_period)
-    post_construction_noi = cf['NOI'] * (cf['Month'] > construction_period)
-    operating_shortfall = np.maximum(0, post_construction_interest - post_construction_noi)
-    total_operating_reserve = operating_shortfall.sum()
+        total_debt = total_costs * loan_to_cost_ratio
+        total_equity = total_costs - total_debt
+        
+        closing_cost_origination = total_debt * origination_fee_pct
+        closing_cost_debt_proc = total_debt * debt_procurement_fee_pct
+        closing_cost_equity_proc = total_equity * equity_procurement_fee_pct
+        total_closing_costs = closing_cost_origination + closing_cost_debt_proc + closing_cost_equity_proc + legal_fees + ir_cap_costs + other_closing_costs
+        
+        cf = pd.DataFrame(index=pd.to_datetime(dates), dtype=np.float64)
+        cf['Month'] = range(1, hold_period + 1)
+        
+        construction_costs_monthly = np.zeros(hold_period)
+        if construction_period > 0:
+            hard_cost_pct = generate_s_curve_distribution(construction_period)
+            construction_costs_monthly[:construction_period] += total_hard_costs * hard_cost_pct
+            construction_costs_monthly[:construction_period] += (total_soft_costs + total_fees) / construction_period
+        
+        cf['Base Project Spend'] = construction_costs_monthly
+        cf.iloc[0, cf.columns.get_loc('Base Project Spend')] += (land_costs + total_closing_costs + total_operating_reserve)
+        
+        cf['Occupied Units'] = [min(stabilized_occupied_units, leased_units_per_month * (m - construction_period)) if m > construction_period else 0 for m in cf['Month']]
+        cf['Occupancy Rate'] = cf['Occupied Units'] / num_units if num_units > 0 else 0
+
+        weighted_rent = (studio_rent * studio_units + one_bed_rent * one_bed_units + two_bed_rent * two_bed_units + three_bed_rent * three_bed_units) / num_units if num_units > 0 else 0
+        opex_escalation_factor = (1 + opex_escalation) ** (cf['Month'] / 12)
+        revenue_escalation_factor = (1 + revenue_escalation) ** (cf['Month'] / 12)
+        cf['GPR'] = cf['Occupied Units'] * weighted_rent * revenue_escalation_factor
+        cf['Vacancy Loss'] = cf['GPR'] * min_vacancy_rate
+        cf['Credit Loss'] = cf['GPR'] * credit_loss
+        cf['Effective Billed Revenue'] = cf['GPR'] - cf['Vacancy Loss'] - cf['Credit Loss']
+        cf['EGI'] = cf['Effective Billed Revenue'] / (1 - other_income_pct) if other_income_pct < 1 else cf['Effective Billed Revenue']
+        cf['Other Income'] = cf['EGI'] * other_income_pct
+        cf['Opex'] = cf['Occupied Units'] * (opex_per_unit_year / 12) * opex_escalation_factor
+        cf['RE Taxes'] = cf['Occupied Units'] * (re_taxes_per_unit_year / 12) * opex_escalation_factor
+        cf['Insurance'] = cf['Occupied Units'] * (insurance_per_unit_year / 12) * opex_escalation_factor
+        cf['Management Fee'] = cf['EGI'] * mgmt_fee_pct
+        cf['Total Opex'] = cf['Opex'] + cf['RE Taxes'] + cf['Insurance'] + cf['Management Fee']
+        cf['NOI'] = cf['EGI'] - cf['Total Opex']
+        
+        cf['Net Funding Requirement'] = cf['Base Project Spend'] - cf['NOI']
+        
+        outstanding_balance = np.zeros(hold_period + 1, dtype=np.float64)
+        monthly_interest = np.zeros(hold_period, dtype=np.float64)
+        capitalized_interest_monthly = np.zeros(hold_period, dtype=np.float64)
+        
+        cf['Equity Draw'] = 0.0
+        cf['Debt Draw'] = 0.0
+
+        for m in range(hold_period):
+            monthly_interest[m] = outstanding_balance[m] * interest_rate / 12
+            funding_req_this_month = cf['Net Funding Requirement'].iloc[m]
+
+            if cf['Month'].iloc[m] <= construction_period:
+                funding_req_this_month += monthly_interest[m]
+                capitalized_interest_monthly[m] = monthly_interest[m]
+            
+            equity_drawn_so_far = cf['Equity Draw'].sum()
+            equity_to_draw = max(0, min(funding_req_this_month, total_equity - equity_drawn_so_far))
+            
+            cf.loc[cf.index[m], 'Equity Draw'] = equity_to_draw
+            cf.loc[cf.index[m], 'Debt Draw'] = funding_req_this_month - equity_to_draw
+            
+            outstanding_balance[m+1] = outstanding_balance[m] + cf.loc[cf.index[m], 'Debt Draw']
+
+        total_capitalized_interest = capitalized_interest_monthly.sum()
+        
+        post_construction_interest = monthly_interest * (cf['Month'] > construction_period)
+        post_construction_noi = cf['NOI'] * (cf['Month'] > construction_period)
+        operating_shortfall = np.maximum(0, post_construction_interest - post_construction_noi)
+        total_operating_reserve = operating_shortfall.sum()
 
 # --- Post-Loop Final Calculations and Data Prep ---
 cf['Monthly Interest'] = monthly_interest
 cf['Capitalized Interest'] = capitalized_interest_monthly
 cf['Interest Paid from Operations'] = np.minimum(cf['NOI'], post_construction_interest)
-
-# FIX: Assign the cash flow to a new column in the `cf` DataFrame
 cf['Investor Cash Flow'] = -cf['Equity Draw'] + cf['NOI'] - cf['Interest Paid from Operations']
+
 outstanding_debt = cf['Debt Draw'].sum()
 final_noi_trended = cf['NOI'].iloc[-1] * 12
 exit_value = final_noi_trended / exit_cap_rate if exit_cap_rate > 0 else 0
